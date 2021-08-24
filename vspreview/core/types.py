@@ -677,11 +677,12 @@ class Output(YAMLObject):
         'frame_to_show',
     )
     __slots__ = storable_attrs + (
-        'vs_output', 'index', 'width', 'height', 'fps_num', 'fps_den',
-        'format', 'total_frames', 'total_time', 'graphics_scene_item',
-        'end_frame', 'end_time', 'fps', 'has_alpha', 'vs_alpha',
-        'format_alpha', 'props', 'source_vs_output', 'source_vs_alpha',
-        'main', 'checkerboard', "__weakref__"
+        'vs_output', 'qt_output', 'is_api_r4', 'index', 'width', 'height',
+        'fps_num', 'fps_den', 'format', 'total_frames', 'total_time',
+        'graphics_scene_item', 'end_frame', 'end_time', 'fps', 'has_alpha',
+        'vs_alpha', 'format_alpha', 'props', 'source_vs_output',
+        'source_vs_alpha', 'main', 'checkerboard', "__weakref__",
+        "cur_frame" # hack to keep the reference to the current frame
     )
 
     def __init__(self, vs_output: Union[vs.VideoNode, vs.AlphaOutputTuple], index: int) -> None:
@@ -707,6 +708,9 @@ class Output(YAMLObject):
 
         self.index        = index
 
+        self.is_api_r4    = 'API R4.' in vs.core.version()
+        self.qt_output    = Qt.QImage.Format_RGB30 if self.source_vs_output.format.bits_per_sample > 8 and self.is_api_r4 and hasattr(
+            vs.core, 'libp2p') else Qt.QImage.Format_RGB32
         self.vs_output    = self.prepare_vs_output(self.source_vs_output)
         self.width        = self.vs_output.width
         self.height       = self.vs_output.height
@@ -743,8 +747,9 @@ class Output(YAMLObject):
 
     def prepare_vs_output(self, vs_output: vs.VideoNode, alpha: bool = False) -> vs.VideoNode:
         resizer = self.main.VS_OUTPUT_RESIZER
+        high_depth_possible = vs_output.format.bits_per_sample > 8 and hasattr(vs.core, 'libp2p')
         resizer_kwargs = {
-            'format'        : vs.COMPATBGR32,
+            'format'        : vs.RGB30 if high_depth_possible else vs.RGB24 if self.is_api_r4 else vs.COMPATBGR32,
             'matrix_in_s'   : self.main.VS_OUTPUT_MATRIX,
             'transfer_in_s' : self.main.VS_OUTPUT_TRANSFER,
             'primaries_in_s': self.main.VS_OUTPUT_PRIMARIES,
@@ -753,10 +758,10 @@ class Output(YAMLObject):
             'prefer_props'  : self.main.VS_OUTPUT_PREFER_PROPS,
         }
 
-        if not alpha:
+        if not alpha and not self.is_api_r4:
             vs_output = vs.core.std.FlipVertical(vs_output)
 
-        if vs_output.format == vs.COMPATBGR32:  # type: ignore
+        if not self.is_api_r4 and vs_output.format == vs.COMPATBGR32:  # type: ignore
             return vs_output
 
         is_subsampled = (vs_output.format.subsampling_w != 0
@@ -774,6 +779,17 @@ class Output(YAMLObject):
 
         vs_output = resizer(vs_output, **resizer_kwargs,
                             **self.main.VS_OUTPUT_RESIZER_KWARGS)
+        if alpha:
+            return vs_output
+        elif self.is_api_r4:
+            if hasattr(vs.core, 'libp2p'):
+                vs_output = vs.core.libp2p.Pack(vs_output)
+            elif hasattr(vs.core, 'akarin'):
+                fmt       = vs.core.query_video_format(vs.GRAY, vs.INTEGER, 32, 0, 0)
+                vs_output = vs.core.akarin.Expr([vs.core.std.ShufflePlanes(vs_output, i, vs.GRAY) for i in range(
+                    3)], f'x {0x10000} * y {0x100} * + z + {0xff} {0x1000000} * +', fmt, opt=1)
+            else:
+                raise ModuleNotFoundError("LibP2P or akarin.Expr required to prepare output clips.")
 
         return vs_output
 
@@ -787,6 +803,7 @@ class Output(YAMLObject):
                 self.vs_alpha.get_frame(int(frame)))
 
     def render_raw_videoframe(self, vs_frame: vs.VideoFrame, vs_frame_alpha: Optional[vs.VideoFrame] = None) -> Qt.QImage:
+        self.cur_frame = (vs_frame, vs_frame_alpha) # keep a reference to the current frame
         # powerful spell. do not touch
         frame_data_pointer = ctypes.cast(
             vs_frame.get_read_ptr(0),
@@ -796,7 +813,7 @@ class Output(YAMLObject):
         )
         frame_image = Qt.QImage(
             frame_data_pointer.contents, vs_frame.width, vs_frame.height,
-            vs_frame.get_stride(0), Qt.QImage.Format_RGB32)
+            vs_frame.get_stride(0), self.qt_output)
 
         if vs_frame_alpha is None:
             return frame_image
